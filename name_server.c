@@ -260,3 +260,48 @@ int get_user_access(FileNode* file, const char* username) {
     }
     return ACCESS_NONE;
 }
+// Update file statistics from Storage Server
+void update_file_stats(FileNode* file) {
+    if (!file || file->metadata.ss_index >= num_storage_servers) return;
+    
+    int ss_index = file->metadata.ss_index;
+    int ss_sock = connect_to_server(storage_servers[ss_index].ip, 
+        storage_servers[ss_index].nm_port);
+    
+    if (ss_sock < 0) return;
+    
+    Message msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = MSG_SS_STAT;
+    strcpy(msg.filename, file->metadata.filename);
+    
+    send_message(ss_sock, &msg);
+    
+    Message response;
+    if (receive_message(ss_sock, &response) == 0 && response.error_code == ERR_SUCCESS) {
+        // Response data contains: word_count char_count
+        sscanf(response.data, "%d %d", &file->metadata.word_count, &file->metadata.char_count);
+    }
+    
+    close(ss_sock);
+}
+
+// Log to file with timestamp
+void log_to_file(const char* format, ...) {
+    if (!log_file) return;
+    
+    time_t now;
+    time(&now);
+    char time_str[64];
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", localtime(&now));
+    
+    fprintf(log_file, "[%s] ", time_str);
+    
+    va_list args;
+    va_start(args, format);
+    vfprintf(log_file, format, args);
+    va_end(args);
+    
+    fprintf(log_file, "\n");
+    fflush(log_file);
+}
