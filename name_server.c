@@ -1100,3 +1100,1333 @@ void handle_exec(int client_sock, Message* msg) {
                    response.error_code);
     }
 }
+
+void handle_create_folder(int client_sock, Message* msg) {
+    pthread_mutex_lock(&data_mutex);
+    
+    Message response;
+    memset(&response, 0, sizeof(response));
+    response.type = MSG_RESPONSE;
+    
+    FolderNode* current = folder_list;
+    while (current) {
+        if (strcmp(current->foldername, msg->folder_path) == 0) {
+            response.error_code = ERR_FILE_EXISTS;
+            sprintf(response.data, "ERROR: Folder '%s' already exists", msg->folder_path);
+            pthread_mutex_unlock(&data_mutex);
+            send_message(client_sock, &response);
+            return;
+        }
+        current = current->next;
+    }
+    
+    // Create physical folder on all storage servers
+    int folder_created = 0;
+    for (int i = 0; i < num_storage_servers; i++) {
+        if (storage_servers[i].is_active) {
+            int ss_sock = connect_to_server(storage_servers[i].ip, storage_servers[i].nm_port);
+            if (ss_sock >= 0) {
+                Message ss_msg;
+                memset(&ss_msg, 0, sizeof(ss_msg));
+                ss_msg.type = MSG_SS_CREATE_FOLDER;
+                strcpy(ss_msg.folder_path, msg->folder_path);
+                strcpy(ss_msg.username, msg->username);
+                
+                send_message(ss_sock, &ss_msg);
+                
+                Message ss_response;
+                if (receive_message(ss_sock, &ss_response) == 0) {
+                    if (ss_response.error_code == ERR_SUCCESS) {
+                        folder_created = 1;
+                        log_message("NM", "Folder '%s' created on SS %s:%d", 
+                                   msg->folder_path, storage_servers[i].ip, storage_servers[i].nm_port);
+                    }
+                }
+                close(ss_sock);
+                
+                if (folder_created) break; // Created on at least one SS
+            }
+        }
+    }
+    
+    if (!folder_created && num_storage_servers > 0) {
+        response.error_code = ERR_NO_STORAGE_SERVER;
+        sprintf(response.data, "ERROR: No storage server available to create folder");
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    // Create metadata entry in Name Server
+    FolderNode* new_folder = (FolderNode*)malloc(sizeof(FolderNode));
+    strcpy(new_folder->foldername, msg->folder_path);
+    strcpy(new_folder->owner, msg->username);
+    time(&new_folder->created);
+    new_folder->next = folder_list;
+    folder_list = new_folder;
+    
+    response.error_code = ERR_SUCCESS;
+    sprintf(response.data, "✓ Folder '%s' created successfully!", msg->folder_path);
+    
+    pthread_mutex_unlock(&data_mutex);
+    send_message(client_sock, &response);
+    log_to_file("CREATEFOLDER: %s by %s", msg->folder_path, msg->username);
+}
+
+// Handle MOVE command - Update filename to include folder path
+void handle_move_file(int client_sock, Message* msg) {
+    pthread_mutex_lock(&data_mutex);
+    
+    FileNode* file = find_file(msg->filename);
+    
+    Message response;
+    memset(&response, 0, sizeof(response));
+    response.type = MSG_RESPONSE;
+    
+    if (!file) {
+        response.error_code = ERR_FILE_NOT_FOUND;
+        sprintf(response.data, "ERROR: File '%s' not found", msg->filename);
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    if (strcmp(file->metadata.owner, msg->username) != 0) {
+        response.error_code = ERR_UNAUTHORIZED;
+        strcpy(response.data, "ERROR: Only owner can move files");
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    // Check if target folder exists
+    FolderNode* folder = folder_list;
+    int folder_found = 0;
+    while (folder) {
+        if (strcmp(folder->foldername, msg->folder_path) == 0) {
+            folder_found = 1;
+            break;
+        }
+        folder = folder->next;
+    }
+    
+    if (!folder_found && strcmp(msg->folder_path, "/") != 0 && strlen(msg->folder_path) > 0) {
+        response.error_code = ERR_FILE_NOT_FOUND;
+        sprintf(response.data, "ERROR: Folder '%s' not found. Create it first with CREATEFOLDER.", msg->folder_path);
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    // Extract just the filename (without any current folder path)
+    char base_filename[MAX_FILENAME];
+    char* last_slash = strrchr(msg->filename, '/');
+    if (last_slash) {
+        strcpy(base_filename, last_slash + 1);
+    } else {
+        strcpy(base_filename, msg->filename);
+    }
+    
+    // Construct new filename with folder path
+    char new_filename[MAX_FILENAME];
+    if (strlen(msg->folder_path) > 0 && strcmp(msg->folder_path, "/") != 0) {
+        snprintf(new_filename, sizeof(new_filename), "%s/%s", msg->folder_path, base_filename);
+    } else {
+        strcpy(new_filename, base_filename);
+    }
+    
+    // Get the storage server for this file
+    int ss_idx = file->metadata.ss_index;
+    if (ss_idx < 0 || ss_idx >= num_storage_servers || !storage_servers[ss_idx].is_active) {
+        response.error_code = ERR_NO_STORAGE_SERVER;
+        strcpy(response.data, "ERROR: Storage server not available");
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    // Send physical move request to Storage Server
+    int ss_sock = connect_to_server(storage_servers[ss_idx].ip, storage_servers[ss_idx].nm_port);
+    if (ss_sock < 0) {
+        response.error_code = ERR_NO_STORAGE_SERVER;
+        strcpy(response.data, "ERROR: Cannot connect to storage server");
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    Message ss_msg;
+    memset(&ss_msg, 0, sizeof(ss_msg));
+    ss_msg.type = MSG_SS_MOVE_FILE;
+    strcpy(ss_msg.filename, msg->filename);  // Old full path (e.g., "test.txt" or "old/test.txt")
+    strcpy(ss_msg.folder_path, new_filename); // New full path (e.g., "documents/test.txt")
+    
+    send_message(ss_sock, &ss_msg);
+    
+    Message ss_response;
+    if (receive_message(ss_sock, &ss_response) != 0 || ss_response.error_code != ERR_SUCCESS) {
+        response.error_code = ERR_INVALID_COMMAND;
+        sprintf(response.data, "ERROR: Failed to move file on storage server: %s", ss_response.data);
+        close(ss_sock);
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    close(ss_sock);
+    
+    // Update hash table with new filename as key
+    update_file_hash(msg->filename, new_filename, file);
+    
+    // Update metadata - change the filename to include folder path
+    strcpy(file->metadata.filename, new_filename);
+    // Update folder_path for VIEWFOLDER compatibility
+    strcpy(file->metadata.folder_path, msg->folder_path);
+    response.error_code = ERR_SUCCESS;
+    sprintf(response.data, "✓ File moved to '%s'", new_filename);
+    save_metadata();
+    
+    pthread_mutex_unlock(&data_mutex);
+    send_message(client_sock, &response);
+    log_to_file("MOVE: %s to %s by %s", msg->filename, new_filename, msg->username);
+}
+
+// Handle VIEWFOLDER command
+void handle_view_folder(int client_sock, Message* msg) {
+    pthread_mutex_lock(&data_mutex);
+    
+    Message response;
+    memset(&response, 0, sizeof(response));
+    response.type = MSG_RESPONSE;
+    response.error_code = ERR_SUCCESS;
+    
+    char buffer[MAX_BUFFER_SIZE] = {0};
+    int offset = 0;
+    
+    offset += sprintf(buffer + offset, "─── Files in folder '%s' ───\n", msg->folder_path);
+    
+    FileNode* current = file_list;
+    int count = 0;
+    while (current && offset < MAX_BUFFER_SIZE - 256) {
+        if (strcmp(current->metadata.folder_path, msg->folder_path) == 0) {
+            int access = get_user_access(current, msg->username);
+            if (access != ACCESS_NONE) {
+                offset += sprintf(buffer + offset, "  • %s (owner: %s)\n", 
+                    current->metadata.filename, current->metadata.owner);
+                count++;
+            }
+        }
+        current = current->next;
+    }
+    
+    if (count == 0) {
+        offset += sprintf(buffer + offset, "  (empty)\n");
+    }
+    
+    strcpy(response.data, buffer);
+    response.data_len = strlen(buffer);
+    
+    pthread_mutex_unlock(&data_mutex);
+    send_message(client_sock, &response);
+    log_to_file("VIEWFOLDER: %s by %s", msg->folder_path, msg->username);
+}
+
+// Handle CHECKPOINT command - Create a snapshot of a file
+void handle_checkpoint(int client_sock, Message* msg) {
+    pthread_mutex_lock(&data_mutex);
+    
+    FileNode* file = find_file(msg->filename);
+    
+    Message response;
+    memset(&response, 0, sizeof(response));
+    response.type = MSG_RESPONSE;
+    
+    if (!file) {
+        response.error_code = ERR_FILE_NOT_FOUND;
+        sprintf(response.data, "ERROR: File '%s' not found", msg->filename);
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    // Check write access
+    int access = get_user_access(file, msg->username);
+    if ((access & ACCESS_WRITE) == 0) {
+        response.error_code = ERR_UNAUTHORIZED;
+        strcpy(response.data, "ERROR: Write access required to create checkpoint");
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    int ss_index = file->metadata.ss_index;
+    if (ss_index < 0 || ss_index >= num_storage_servers || !storage_servers[ss_index].is_active) {
+        response.error_code = ERR_NO_STORAGE_SERVER;
+        strcpy(response.data, "ERROR: Storage server not available");
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    pthread_mutex_unlock(&data_mutex);
+    
+    // Forward to storage server
+    int ss_sock = connect_to_server(storage_servers[ss_index].ip, storage_servers[ss_index].nm_port);
+    if (ss_sock < 0) {
+        response.error_code = ERR_CONNECTION_FAILED;
+        strcpy(response.data, "ERROR: Cannot connect to storage server");
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    Message ss_msg;
+    memset(&ss_msg, 0, sizeof(ss_msg));
+    ss_msg.type = MSG_SS_CHECKPOINT;
+    strcpy(ss_msg.filename, msg->filename);
+    strcpy(ss_msg.username, msg->username);
+    strcpy(ss_msg.checkpoint_tag, msg->checkpoint_tag);
+    
+    send_message(ss_sock, &ss_msg);
+    
+    Message ss_response;
+    if (receive_message(ss_sock, &ss_response) == 0) {
+        response.error_code = ss_response.error_code;
+        strcpy(response.data, ss_response.data);
+    } else {
+        response.error_code = ERR_SERVER_ERROR;
+        strcpy(response.data, "ERROR: Communication with storage server failed");
+    }
+    
+    close(ss_sock);
+    send_message(client_sock, &response);
+    log_to_file("CHECKPOINT: %s tag=%s by %s", msg->filename, msg->checkpoint_tag, msg->username);
+}
+
+// Handle VIEW_CHECKPOINT command
+void handle_view_checkpoint(int client_sock, Message* msg) {
+    pthread_mutex_lock(&data_mutex);
+    
+    FileNode* file = find_file(msg->filename);
+    
+    Message response;
+    memset(&response, 0, sizeof(response));
+    response.type = MSG_RESPONSE;
+    
+    if (!file) {
+        response.error_code = ERR_FILE_NOT_FOUND;
+        sprintf(response.data, "ERROR: File '%s' not found", msg->filename);
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    // Check read access
+    int access = get_user_access(file, msg->username);
+    if ((access & ACCESS_READ) == 0) {
+        response.error_code = ERR_UNAUTHORIZED;
+        strcpy(response.data, "ERROR: Read access required to view checkpoint");
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    int ss_index = file->metadata.ss_index;
+    if (ss_index < 0 || ss_index >= num_storage_servers || !storage_servers[ss_index].is_active) {
+        response.error_code = ERR_NO_STORAGE_SERVER;
+        strcpy(response.data, "ERROR: Storage server not available");
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    pthread_mutex_unlock(&data_mutex);
+    
+    // Forward to storage server
+    int ss_sock = connect_to_server(storage_servers[ss_index].ip, storage_servers[ss_index].nm_port);
+    if (ss_sock < 0) {
+        response.error_code = ERR_CONNECTION_FAILED;
+        strcpy(response.data, "ERROR: Cannot connect to storage server");
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    Message ss_msg;
+    memset(&ss_msg, 0, sizeof(ss_msg));
+    ss_msg.type = MSG_SS_CHECKPOINT;
+    ss_msg.flags = 1; // 1 = view checkpoint
+    strcpy(ss_msg.filename, msg->filename);
+    strcpy(ss_msg.username, msg->username);
+    strcpy(ss_msg.checkpoint_tag, msg->checkpoint_tag);
+    
+    send_message(ss_sock, &ss_msg);
+    
+    Message ss_response;
+    if (receive_message(ss_sock, &ss_response) == 0) {
+        response.error_code = ss_response.error_code;
+        strcpy(response.data, ss_response.data);
+    } else {
+        response.error_code = ERR_SERVER_ERROR;
+        strcpy(response.data, "ERROR: Communication with storage server failed");
+    }
+    
+    close(ss_sock);
+    send_message(client_sock, &response);
+    log_to_file("VIEWCHECKPOINT: %s tag=%s by %s", msg->filename, msg->checkpoint_tag, msg->username);
+}
+
+// Handle REVERT_CHECKPOINT command
+void handle_revert_checkpoint(int client_sock, Message* msg) {
+    pthread_mutex_lock(&data_mutex);
+    
+    FileNode* file = find_file(msg->filename);
+    
+    Message response;
+    memset(&response, 0, sizeof(response));
+    response.type = MSG_RESPONSE;
+    
+    if (!file) {
+        response.error_code = ERR_FILE_NOT_FOUND;
+        sprintf(response.data, "ERROR: File '%s' not found", msg->filename);
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    // Check write access
+    int access = get_user_access(file, msg->username);
+    if ((access & ACCESS_WRITE) == 0) {
+        response.error_code = ERR_UNAUTHORIZED;
+        strcpy(response.data, "ERROR: Write access required to revert checkpoint");
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    int ss_index = file->metadata.ss_index;
+    if (ss_index < 0 || ss_index >= num_storage_servers || !storage_servers[ss_index].is_active) {
+        response.error_code = ERR_NO_STORAGE_SERVER;
+        strcpy(response.data, "ERROR: Storage server not available");
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    pthread_mutex_unlock(&data_mutex);
+    
+    // Forward to storage server
+    int ss_sock = connect_to_server(storage_servers[ss_index].ip, storage_servers[ss_index].nm_port);
+    if (ss_sock < 0) {
+        response.error_code = ERR_CONNECTION_FAILED;
+        strcpy(response.data, "ERROR: Cannot connect to storage server");
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    Message ss_msg;
+    memset(&ss_msg, 0, sizeof(ss_msg));
+    ss_msg.type = MSG_SS_CHECKPOINT;
+    ss_msg.flags = 2; // 2 = revert checkpoint
+    strcpy(ss_msg.filename, msg->filename);
+    strcpy(ss_msg.username, msg->username);
+    strcpy(ss_msg.checkpoint_tag, msg->checkpoint_tag);
+    
+    send_message(ss_sock, &ss_msg);
+    
+    Message ss_response;
+    if (receive_message(ss_sock, &ss_response) == 0) {
+        response.error_code = ss_response.error_code;
+        strcpy(response.data, ss_response.data);
+    } else {
+        response.error_code = ERR_SERVER_ERROR;
+        strcpy(response.data, "ERROR: Communication with storage server failed");
+    }
+    
+    close(ss_sock);
+    send_message(client_sock, &response);
+    log_to_file("REVERT: %s tag=%s by %s", msg->filename, msg->checkpoint_tag, msg->username);
+}
+
+// Handle LIST_CHECKPOINTS command
+void handle_list_checkpoints(int client_sock, Message* msg) {
+    pthread_mutex_lock(&data_mutex);
+    
+    FileNode* file = find_file(msg->filename);
+    
+    Message response;
+    memset(&response, 0, sizeof(response));
+    response.type = MSG_RESPONSE;
+    
+    if (!file) {
+        response.error_code = ERR_FILE_NOT_FOUND;
+        sprintf(response.data, "ERROR: File '%s' not found", msg->filename);
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    // Check read access
+    int access = get_user_access(file, msg->username);
+    if ((access & ACCESS_READ) == 0) {
+        response.error_code = ERR_UNAUTHORIZED;
+        strcpy(response.data, "ERROR: Read access required to list checkpoints");
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    int ss_index = file->metadata.ss_index;
+    if (ss_index < 0 || ss_index >= num_storage_servers || !storage_servers[ss_index].is_active) {
+        response.error_code = ERR_NO_STORAGE_SERVER;
+        strcpy(response.data, "ERROR: Storage server not available");
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    pthread_mutex_unlock(&data_mutex);
+    
+    // Forward to storage server
+    int ss_sock = connect_to_server(storage_servers[ss_index].ip, storage_servers[ss_index].nm_port);
+    if (ss_sock < 0) {
+        response.error_code = ERR_CONNECTION_FAILED;
+        strcpy(response.data, "ERROR: Cannot connect to storage server");
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    Message ss_msg;
+    memset(&ss_msg, 0, sizeof(ss_msg));
+    ss_msg.type = MSG_SS_CHECKPOINT;
+    ss_msg.flags = 3; // 3 = list checkpoints
+    strcpy(ss_msg.filename, msg->filename);
+    strcpy(ss_msg.username, msg->username);
+    
+    send_message(ss_sock, &ss_msg);
+    
+    Message ss_response;
+    if (receive_message(ss_sock, &ss_response) == 0) {
+        response.error_code = ss_response.error_code;
+        strcpy(response.data, ss_response.data);
+    } else {
+        response.error_code = ERR_SERVER_ERROR;
+        strcpy(response.data, "ERROR: Communication with storage server failed");
+    }
+    
+    close(ss_sock);
+    send_message(client_sock, &response);
+    log_to_file("LISTCHECKPOINTS: %s by %s", msg->filename, msg->username);
+}
+
+// Handle REQUEST ACCESS command
+void handle_request_access(int client_sock, Message* msg) {
+    pthread_mutex_lock(&data_mutex);
+    
+    FileNode* file = find_file(msg->filename);
+    
+    Message response;
+    memset(&response, 0, sizeof(response));
+    response.type = MSG_RESPONSE;
+    
+    if (!file) {
+        response.error_code = ERR_FILE_NOT_FOUND;
+        sprintf(response.data, "ERROR: File '%s' not found", msg->filename);
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    // Check if user already has access
+    int current_access = get_user_access(file, msg->username);
+    if (current_access & msg->flags) {
+        response.error_code = ERR_INVALID_COMMAND;
+        strcpy(response.data, "ERROR: You already have the requested access");
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    // Check if user is the owner
+    if (strcmp(file->metadata.owner, msg->username) == 0) {
+        response.error_code = ERR_INVALID_COMMAND;
+        strcpy(response.data, "ERROR: You are the owner - you have full access");
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    // Check if request already exists
+    for (int i = 0; i < num_access_requests; i++) {
+        if (strcmp(access_requests[i].filename, msg->filename) == 0 &&
+            strcmp(access_requests[i].requester, msg->username) == 0) {
+            response.error_code = ERR_INVALID_COMMAND;
+            strcpy(response.data, "ERROR: You already have a pending request for this file");
+            pthread_mutex_unlock(&data_mutex);
+            send_message(client_sock, &response);
+            return;
+        }
+    }
+    
+    // Add new access request
+    if (num_access_requests >= max_access_requests) {
+        response.error_code = ERR_SERVER_ERROR;
+        strcpy(response.data, "ERROR: Too many pending access requests");
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    strcpy(access_requests[num_access_requests].filename, msg->filename);
+    strcpy(access_requests[num_access_requests].requester, msg->username);
+    access_requests[num_access_requests].requested_rights = msg->flags;
+    time(&access_requests[num_access_requests].request_time);
+    num_access_requests++;
+    
+    response.error_code = ERR_SUCCESS;
+    sprintf(response.data, "✓ Access request sent to owner of '%s' (%s)", 
+            msg->filename, file->metadata.owner);
+    
+    pthread_mutex_unlock(&data_mutex);
+    send_message(client_sock, &response);
+    log_to_file("REQUEST ACCESS: %s for %s by %s (rights=%d)", 
+                msg->filename, file->metadata.owner, msg->username, msg->flags);
+}
+
+// Handle VIEW REQUESTS command
+void handle_view_requests(int client_sock, Message* msg) {
+    pthread_mutex_lock(&data_mutex);
+    
+    Message response;
+    memset(&response, 0, sizeof(response));
+    response.type = MSG_RESPONSE;
+    response.error_code = ERR_SUCCESS;
+    
+    char buffer[MAX_BUFFER_SIZE];
+    int offset = 0;
+    
+    offset += sprintf(buffer + offset, "─── Pending Access Requests ───\n");
+    
+    int count = 0;
+    for (int i = 0; i < num_access_requests && offset < MAX_BUFFER_SIZE - 256; i++) {
+        // Find the file to check ownership
+        FileNode* file = find_file(access_requests[i].filename);
+        if (file && strcmp(file->metadata.owner, msg->username) == 0) {
+            char time_str[64];
+            format_time(access_requests[i].request_time, time_str, sizeof(time_str));
+            const char* access_type = (access_requests[i].requested_rights == ACCESS_READ) ? "READ" : "WRITE";
+            
+            offset += sprintf(buffer + offset, "  • %s requests %s access to '%s' (%s)\n",
+                            access_requests[i].requester, access_type, 
+                            access_requests[i].filename, time_str);
+            count++;
+        }
+    }
+    
+    if (count == 0) {
+        offset += sprintf(buffer + offset, "(no pending requests)\n");
+    } else {
+        offset += sprintf(buffer + offset, "\nUse: APPROVEREQUEST <requester> <filename>\n");
+        offset += sprintf(buffer + offset, "     DENYREQUEST <requester> <filename>\n");
+    }
+    
+    strcpy(response.data, buffer);
+    
+    pthread_mutex_unlock(&data_mutex);
+    send_message(client_sock, &response);
+    log_to_file("VIEWREQUESTS: by %s (%d requests)", msg->username, count);
+}
+
+// Handle APPROVE REQUEST command
+void handle_approve_request(int client_sock, Message* msg) {
+    pthread_mutex_lock(&data_mutex);
+    
+    FileNode* file = find_file(msg->filename);
+    
+    Message response;
+    memset(&response, 0, sizeof(response));
+    response.type = MSG_RESPONSE;
+    
+    if (!file) {
+        response.error_code = ERR_FILE_NOT_FOUND;
+        sprintf(response.data, "ERROR: File '%s' not found", msg->filename);
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    // Check if user is the owner
+    if (strcmp(file->metadata.owner, msg->username) != 0) {
+        response.error_code = ERR_UNAUTHORIZED;
+        strcpy(response.data, "ERROR: Only the file owner can approve access requests");
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    // Find the access request
+    int request_index = -1;
+    for (int i = 0; i < num_access_requests; i++) {
+        if (strcmp(access_requests[i].filename, msg->filename) == 0 &&
+            strcmp(access_requests[i].requester, msg->target_user) == 0) {
+            request_index = i;
+            break;
+        }
+    }
+    
+    if (request_index < 0) {
+        response.error_code = ERR_INVALID_COMMAND;
+        sprintf(response.data, "ERROR: No pending request from '%s' for '%s'", 
+                msg->target_user, msg->filename);
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    // Grant the requested access
+    int requested_rights = access_requests[request_index].requested_rights;
+    
+    // Check if user already has access in the access list
+    int user_found = 0;
+    for (int i = 0; i < file->access_count; i++) {
+        if (strcmp(file->access_list[i].username, msg->target_user) == 0) {
+            // User exists, add the requested rights
+            file->access_list[i].access_rights |= requested_rights;
+            user_found = 1;
+            break;
+        }
+    }
+    
+    // If user not in access list, add them
+    if (!user_found) {
+        file->access_list = (UserAccess*)realloc(file->access_list, 
+                                                 (file->access_count + 1) * sizeof(UserAccess));
+        strcpy(file->access_list[file->access_count].username, msg->target_user);
+        file->access_list[file->access_count].access_rights = requested_rights;
+        file->access_count++;
+    }
+    
+    // Remove the request from the queue
+    for (int i = request_index; i < num_access_requests - 1; i++) {
+        access_requests[i] = access_requests[i + 1];
+    }
+    num_access_requests--;
+    
+    // Save metadata
+    save_metadata();
+    
+    response.error_code = ERR_SUCCESS;
+    const char* access_type = (requested_rights == ACCESS_READ) ? "READ" : "WRITE";
+    sprintf(response.data, "✓ Granted %s access to '%s' for user '%s'", 
+            access_type, msg->filename, msg->target_user);
+    
+    pthread_mutex_unlock(&data_mutex);
+    send_message(client_sock, &response);
+    log_to_file("APPROVE: %s granted %s access to %s for %s", 
+                msg->username, access_type, msg->filename, msg->target_user);
+}
+
+// Handle DENY REQUEST command
+void handle_deny_request(int client_sock, Message* msg) {
+    pthread_mutex_lock(&data_mutex);
+    
+    FileNode* file = find_file(msg->filename);
+    
+    Message response;
+    memset(&response, 0, sizeof(response));
+    response.type = MSG_RESPONSE;
+    
+    if (!file) {
+        response.error_code = ERR_FILE_NOT_FOUND;
+        sprintf(response.data, "ERROR: File '%s' not found", msg->filename);
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    // Check if user is the owner
+    if (strcmp(file->metadata.owner, msg->username) != 0) {
+        response.error_code = ERR_UNAUTHORIZED;
+        strcpy(response.data, "ERROR: Only the file owner can deny access requests");
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    // Find and remove the access request
+    int request_index = -1;
+    for (int i = 0; i < num_access_requests; i++) {
+        if (strcmp(access_requests[i].filename, msg->filename) == 0 &&
+            strcmp(access_requests[i].requester, msg->target_user) == 0) {
+            request_index = i;
+            break;
+        }
+    }
+    
+    if (request_index < 0) {
+        response.error_code = ERR_INVALID_COMMAND;
+        sprintf(response.data, "ERROR: No pending request from '%s' for '%s'", 
+                msg->target_user, msg->filename);
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    // Remove the request from the queue
+    for (int i = request_index; i < num_access_requests - 1; i++) {
+        access_requests[i] = access_requests[i + 1];
+    }
+    num_access_requests--;
+    
+    response.error_code = ERR_SUCCESS;
+    sprintf(response.data, "✓ Access request from '%s' for '%s' denied", 
+            msg->target_user, msg->filename);
+    
+    pthread_mutex_unlock(&data_mutex);
+    send_message(client_sock, &response);
+    log_to_file("DENY: %s denied access to %s for %s", 
+                msg->username, msg->filename, msg->target_user);
+}
+
+// Helper functions for metrics
+int count_files() {
+    int count = 0;
+    FileNode* current = file_list;
+    while (current) {
+        count++;
+        current = current->next;
+    }
+    return count;
+}
+
+int count_folders() {
+    int count = 0;
+    FolderNode* current = folder_list;
+    while (current) {
+        count++;
+        current = current->next;
+    }
+    return count;
+}
+
+// Handle heartbeat from storage server
+void handle_heartbeat(Message* msg) {
+    pthread_mutex_lock(&data_mutex);
+    
+    // Find the storage server by IP and port
+    for (int i = 0; i < num_storage_servers; i++) {
+        if (strcmp(storage_servers[i].ip, msg->ss_ip) == 0 && 
+            storage_servers[i].nm_port == msg->ss_port) {
+            storage_servers[i].last_heartbeat = time(NULL);
+            
+            // Mark as active if it was inactive
+            if (!storage_servers[i].is_active) {
+                storage_servers[i].is_active = 1;
+                log_message("NM", "Storage Server %s:%d is now ACTIVE", msg->ss_ip, msg->ss_port);
+            }
+            
+            pthread_mutex_unlock(&data_mutex);
+            return;
+        }
+    }
+    
+    pthread_mutex_unlock(&data_mutex);
+    log_message("NM", "Received heartbeat from unknown SS %s:%d", msg->ss_ip, msg->ss_port);
+}
+
+// Handle replication request - Notifies secondary to replicate from primary
+void handle_replication_request(int client_sock, Message* msg) {
+    printf("[DEBUG NM] Received replication request for: %s\n", msg->filename);
+    fflush(stdout);
+    
+    pthread_mutex_lock(&data_mutex);
+    
+    FileNode* file = find_file(msg->filename);
+    
+    Message response;
+    memset(&response, 0, sizeof(response));
+    response.type = MSG_ACK;
+    
+    if (!file) {
+        printf("[DEBUG NM] File not found: %s\n", msg->filename);
+        fflush(stdout);
+        response.error_code = ERR_FILE_NOT_FOUND;
+        strcpy(response.data, "File not found");
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    int replica_idx = file->metadata.replica_ss_index;
+    
+    printf("[DEBUG NM] File found. Primary SS: %d, Replica SS: %d\n", 
+           file->metadata.ss_index, replica_idx);
+    fflush(stdout);
+    
+    if (replica_idx < 0 || replica_idx >= num_storage_servers || !storage_servers[replica_idx].is_active) {
+        response.error_code = ERR_NO_STORAGE_SERVER;
+        strcpy(response.data, "No active replica server");
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        log_message("NM", "No active replica for %s", msg->filename);
+        return;
+    }
+    
+    int primary_idx = file->metadata.ss_index;
+    
+    pthread_mutex_unlock(&data_mutex);
+    
+    // Connect to secondary/replica storage server
+    int replica_sock = connect_to_server(storage_servers[replica_idx].ip, 
+                                         storage_servers[replica_idx].nm_port);
+    
+    if (replica_sock < 0) {
+        response.error_code = ERR_CONNECTION_FAILED;
+        strcpy(response.data, "Cannot connect to replica server");
+        send_message(client_sock, &response);
+        log_message("NM", "Failed to connect to replica SS%d for %s", replica_idx, msg->filename);
+        return;
+    }
+    
+    // Send replication command to secondary
+    Message repl_msg;
+    memset(&repl_msg, 0, sizeof(repl_msg));
+    repl_msg.type = MSG_SS_REPLICATE;
+    strcpy(repl_msg.filename, msg->filename);
+    strcpy(repl_msg.ss_ip, storage_servers[primary_idx].ip);
+    repl_msg.ss_port = storage_servers[primary_idx].client_port;
+    repl_msg.flags = primary_idx; // Store primary index
+    
+    send_message(replica_sock, &repl_msg);
+    
+    Message repl_response;
+    if (receive_message(replica_sock, &repl_response) == 0) {
+        response.error_code = repl_response.error_code;
+        strcpy(response.data, repl_response.data);
+        log_message("NM", "🔄 Replication of '%s' from SS%d to SS%d: %s", 
+                   msg->filename, primary_idx, replica_idx, repl_response.data);
+    } else {
+        response.error_code = ERR_SERVER_ERROR;
+        strcpy(response.data, "Replication communication failed");
+    }
+    
+    close(replica_sock);
+    send_message(client_sock, &response);
+}
+
+// Monitor storage servers for failures
+void* monitor_storage_servers(void* arg) {
+    log_message("NM", "Starting storage server monitoring thread");
+    
+    while (1) {
+        sleep(5); // Check every 5 seconds
+        
+        pthread_mutex_lock(&data_mutex);
+        time_t current_time = time(NULL);
+        
+        for (int i = 0; i < num_storage_servers; i++) {
+            if (storage_servers[i].is_active) {
+                time_t time_since_heartbeat = current_time - storage_servers[i].last_heartbeat;
+                
+                // If no heartbeat for 30 seconds, mark as inactive
+                if (time_since_heartbeat > 30) {
+                    storage_servers[i].is_active = 0;
+                    log_message("NM", "Storage Server %s:%d marked INACTIVE (no heartbeat for %ld seconds)",
+                               storage_servers[i].ip, storage_servers[i].nm_port, time_since_heartbeat);
+                    
+                    // Trigger failover for files on this server
+                    FileNode* current = file_list;
+                    while (current) {
+                        if (current->metadata.ss_index == i && current->metadata.replica_ss_index != -1) {
+                            log_message("NM", "Failover: Promoting replica for file %s", current->metadata.filename);
+                            current->metadata.ss_index = current->metadata.replica_ss_index;
+                            current->metadata.replica_ss_index = -1; // No more replica
+                        }
+                        current = current->next;
+                    }
+                }
+            }
+        }
+        
+        pthread_mutex_unlock(&data_mutex);
+    }
+    
+    return NULL;
+}
+
+// Handle client connection
+void* handle_client(void* arg) {
+    ClientThreadArg* client_arg = (ClientThreadArg*)arg;
+    int client_sock = client_arg->sock;
+    char client_ip[INET_ADDRSTRLEN];
+    strcpy(client_ip, client_arg->ip);
+    int client_port = client_arg->port;
+    free(client_arg);
+    
+    Message msg;
+    while (receive_message(client_sock, &msg) == 0) {
+        log_message("NM", "Received message type %d from client %s (IP: %s:%d)", 
+                   msg.type, msg.username, client_ip, client_port);
+        
+        switch (msg.type) {
+            case MSG_REGISTER_CLIENT:
+                pthread_mutex_lock(&data_mutex);
+                if (num_clients < MAX_CLIENTS) {
+                    strcpy(clients[num_clients].username, msg.username);
+                    strcpy(clients[num_clients].ip, client_ip);
+                    clients[num_clients].sock = client_sock;
+                    time(&clients[num_clients].connected_time);
+                    num_clients++;
+                    
+                    Message response;
+                    memset(&response, 0, sizeof(response));
+                    response.type = MSG_ACK;
+                    response.error_code = ERR_SUCCESS;
+                    strcpy(response.data, "Client registered successfully");
+                    send_message(client_sock, &response);
+                    
+                    log_message("NM", "Client %s registered from %s:%d", 
+                               msg.username, client_ip, client_port);
+                    log_to_file("Client %s registered from %s:%d - SUCCESS", 
+                               msg.username, client_ip, client_port);
+                    log_to_file("ACK SENT to %s (IP: %s:%d): Client registered successfully [Error Code: 0]", 
+                               msg.username, client_ip, client_port);
+                }
+                pthread_mutex_unlock(&data_mutex);
+                break;
+                
+            case MSG_REGISTER_SS:
+                pthread_mutex_lock(&data_mutex);
+                if (num_storage_servers < MAX_STORAGE_SERVERS) {
+                    strcpy(storage_servers[num_storage_servers].ip, msg.ss_ip);
+                    storage_servers[num_storage_servers].nm_port = msg.ss_port;
+                    storage_servers[num_storage_servers].client_port = msg.flags;
+                    storage_servers[num_storage_servers].is_active = 1;
+                    time(&storage_servers[num_storage_servers].last_heartbeat);
+                    
+                    // Parse file list from msg.data (for recovery/sync purposes only)
+                    // Note: We don't add these to metadata as they should only be created via client CREATE
+                    char data_copy[MAX_BUFFER_SIZE];
+                    strcpy(data_copy, msg.data);
+                    char* token = strtok(data_copy, "\n");
+                    while (token) {
+                        // Just acknowledge existing files, don't add to metadata
+                        // Files should only be in metadata if created via CREATE command
+                        token = strtok(NULL, "\n");
+                    }
+                    
+                    Message response;
+                    memset(&response, 0, sizeof(response));
+                    response.type = MSG_ACK;
+                    response.error_code = ERR_SUCCESS;
+                    sprintf(response.data, "Storage Server registered successfully (index: %d)", 
+                        num_storage_servers);
+                    send_message(client_sock, &response);
+                    
+                    log_message("NM", "Storage Server %s:%d registered (index %d)", 
+                        msg.ss_ip, msg.ss_port, num_storage_servers);
+                    log_to_file("Storage Server %s:%d (client port: %d) registered - SUCCESS", 
+                               msg.ss_ip, msg.ss_port, msg.flags);
+                    
+                    num_storage_servers++;
+                    save_metadata();
+                }
+                pthread_mutex_unlock(&data_mutex);
+                break;
+                
+            case MSG_VIEW_FILES:
+                handle_view(client_sock, &msg);
+                break;
+                
+            case MSG_INFO_FILE:
+                handle_info(client_sock, &msg);
+                break;
+                
+            case MSG_LIST_USERS:
+                handle_list_users(client_sock, &msg);
+                break;
+                
+            case MSG_CREATE_FILE:
+                handle_create(client_sock, &msg);
+                break;
+                
+            case MSG_DELETE_FILE:
+                handle_delete(client_sock, &msg);
+                break;
+                
+            case MSG_READ_FILE:
+            case MSG_WRITE_FILE:
+            case MSG_STREAM_FILE:
+                handle_direct_ss_operation(client_sock, &msg);
+                break;
+                
+            case MSG_ADD_ACCESS:
+            case MSG_REM_ACCESS:
+                handle_access_control(client_sock, &msg);
+                break;
+                
+            case MSG_EXEC_FILE:
+                handle_exec(client_sock, &msg);
+                break;
+                
+            case MSG_UNDO_FILE:
+                handle_direct_ss_operation(client_sock, &msg);
+                break;
+                
+            // Bonus: Folder operations
+            case MSG_CREATE_FOLDER:
+                handle_create_folder(client_sock, &msg);
+                break;
+                
+            case MSG_MOVE_FILE:
+                handle_move_file(client_sock, &msg);
+                break;
+                
+            case MSG_VIEW_FOLDER:
+                handle_view_folder(client_sock, &msg);
+                break;
+                
+            // Bonus: Checkpoint operations
+            case MSG_CHECKPOINT:
+                metrics.total_creates++;
+                handle_checkpoint(client_sock, &msg);
+                break;
+                
+            case MSG_VIEW_CHECKPOINT:
+                handle_view_checkpoint(client_sock, &msg);
+                break;
+                
+            case MSG_REVERT_CHECKPOINT:
+                handle_revert_checkpoint(client_sock, &msg);
+                break;
+                
+            case MSG_LIST_CHECKPOINTS:
+                handle_list_checkpoints(client_sock, &msg);
+                break;
+            case MSG_REQUEST_ACCESS:
+                handle_request_access(client_sock, &msg);
+                break;
+                
+            case MSG_VIEW_REQUESTS:
+                handle_view_requests(client_sock, &msg);
+                break;
+                
+            case MSG_APPROVE_REQUEST:
+                handle_approve_request(client_sock, &msg);
+                break;
+                
+            case MSG_DENY_REQUEST:
+                handle_deny_request(client_sock, &msg);
+                break;
+            
+            case MSG_HEARTBEAT:
+                handle_heartbeat(&msg);
+                break;
+            
+            case MSG_SS_REPLICATE:
+                handle_replication_request(client_sock, &msg);
+                break;
+                
+            default:
+                log_message("NM", "Unknown message type: %d", msg.type);
+        }
+    }
+    
+    log_message("NM", "Client disconnected");
+    close(client_sock);
+    return NULL;
+}
+
+// Handle storage server registration
+void* handle_storage_server(void* arg) {
+    int ss_sock = *(int*)arg;
+    free(arg);
+    
+    Message msg;
+    if (receive_message(ss_sock, &msg) == 0 && msg.type == MSG_REGISTER_SS) {
+        pthread_mutex_lock(&data_mutex);
+        
+        if (num_storage_servers < MAX_STORAGE_SERVERS) {
+            strcpy(storage_servers[num_storage_servers].ip, msg.ss_ip);
+            storage_servers[num_storage_servers].nm_port = msg.ss_port;
+            storage_servers[num_storage_servers].client_port = msg.flags;
+            storage_servers[num_storage_servers].is_active = 1;
+            time(&storage_servers[num_storage_servers].last_heartbeat);
+            
+            // Parse file list from msg.data (for recovery/sync purposes only)
+            // Note: We don't add these to metadata as they should only be created via client CREATE
+            char* token = strtok(msg.data, "\n");
+            while (token) {
+                // Just acknowledge existing files, don't add to metadata
+                // Files should only be in metadata if created via CREATE command
+                token = strtok(NULL, "\n");
+            }
+            
+            num_storage_servers++;
+            
+            Message response;
+            memset(&response, 0, sizeof(response));
+            response.type = MSG_ACK;
+            response.error_code = ERR_SUCCESS;
+            sprintf(response.data, "Storage Server registered successfully (index: %d)", 
+                num_storage_servers - 1);
+            send_message(ss_sock, &response);
+            
+            log_message("NM", "Storage Server %s:%d registered", msg.ss_ip, msg.ss_port);
+            save_metadata();
+        }
+        
+        pthread_mutex_unlock(&data_mutex);
+    }
+    
+    close(ss_sock);
+    return NULL;
+}
+
+// Save metadata to disk
+void save_metadata() {
+    FILE* fp = fopen(METADATA_FILE, "wb");
+    if (!fp) {
+        log_message("NM", "Error saving metadata: %s", strerror(errno));
+        return;
+    }
+    
+    FileNode* current = file_list;
+    while (current) {
+        fwrite(&current->metadata, sizeof(FileMetadata), 1, fp);
+        fwrite(&current->access_count, sizeof(int), 1, fp);
+        fwrite(current->access_list, sizeof(UserAccess), current->access_count, fp);
+        current = current->next;
+    }
+    
+    fclose(fp);
+    log_message("NM", "Metadata saved");
+}
+
+// Load metadata from disk
+void load_metadata() {
+    FILE* fp = fopen(METADATA_FILE, "rb");
+    if (!fp) {
+        log_message("NM", "No existing metadata file");
+        return;
+    }
+    
+    while (!feof(fp)) {
+        FileMetadata metadata;
+        if (fread(&metadata, sizeof(FileMetadata), 1, fp) != 1) break;
+        
+        int access_count;
+        if (fread(&access_count, sizeof(int), 1, fp) != 1) break;
+        
+        FileNode* node = (FileNode*)malloc(sizeof(FileNode));
+        memcpy(&node->metadata, &metadata, sizeof(FileMetadata));
+        node->access_count = access_count;
+        node->access_list = (UserAccess*)malloc(access_count * sizeof(UserAccess));
+        
+        if (fread(node->access_list, sizeof(UserAccess), access_count, fp) != (size_t)access_count) {
+            free(node->access_list);
+            free(node);
+            break;
+        }
+        
+        node->next = file_list;
+        file_list = node;
+        
+        // Add to hash table
+        unsigned int index = hash_function(metadata.filename);
+        if (file_hash[index] == NULL) {
+            HashEntry* entry = (HashEntry*)malloc(sizeof(HashEntry));
+            strcpy(entry->key, metadata.filename);
+            entry->file = node;
+            file_hash[index] = entry;
+        }
+    }
+    
+    fclose(fp);
+    log_message("NM", "Metadata loaded");
+}
+
+int main() {
+    log_message("NM", "Starting Name Server on port %d", NM_PORT);
+    
+    // Initialize
+    init_cache();
+    memset(file_hash, 0, sizeof(file_hash));
+    memset(storage_servers, 0, sizeof(storage_servers));
+    memset(clients, 0, sizeof(clients));
+    
+    // Bonus: Initialize metrics and bonus data structures
+    time(&metrics.start_time);
+    folder_list = NULL;
+    checkpoints = (Checkpoint*)calloc(max_checkpoints, sizeof(Checkpoint));
+    access_requests = (AccessRequest*)calloc(max_access_requests, sizeof(AccessRequest));
+    num_checkpoints = 0;
+    num_access_requests = 0;
+    
+    if (!checkpoints || !access_requests) {
+        log_message("NM", "ERROR: Cannot allocate memory for bonus features");
+        return 1;
+    }
+    
+    // Open log file
+    log_file = fopen("nm_log.txt", "a");
+    if (!log_file) {
+        log_message("NM", "Warning: Cannot open log file");
+    }
+    
+    // Load existing metadata
+    load_metadata();
+    
+    log_message("NM", "✓ Bonus Features Enabled: Folders, Checkpoints, Access Requests, Search, Metrics");
+    
+    // Create server socket
+    int server_sock = create_socket(NM_PORT);
+    if (server_sock < 0) {
+        log_message("NM", "Failed to create server socket");
+        return 1;
+    }
+    
+    log_message("NM", "Name Server started successfully");
+    
+    // Start monitoring thread for fault tolerance
+    pthread_t monitor_thread;
+    if (pthread_create(&monitor_thread, NULL, monitor_storage_servers, NULL) != 0) {
+        log_message("NM", "Warning: Failed to start monitoring thread");
+    } else {
+        pthread_detach(monitor_thread);
+        log_message("NM", "✓ Storage Server monitoring thread started");
+    }
+    
+    // Accept connections
+    while (1) {
+        struct sockaddr_in client_addr;
+        socklen_t addr_len = sizeof(client_addr);
+        
+        int client_sock_val = accept(server_sock, (struct sockaddr*)&client_addr, &addr_len);
+        
+        if (client_sock_val < 0) {
+            log_message("NM", "Error accepting connection: %s", strerror(errno));
+            continue;
+        }
+        
+        char client_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+        log_message("NM", "New connection from %s:%d", client_ip, ntohs(client_addr.sin_port));
+        
+        // Create thread arg with socket and IP
+        ClientThreadArg* client_arg = (ClientThreadArg*)malloc(sizeof(ClientThreadArg));
+        client_arg->sock = client_sock_val;
+        strcpy(client_arg->ip, client_ip);
+        client_arg->port = ntohs(client_addr.sin_port);
+        
+        // Create thread to handle connection
+        pthread_t thread;
+        pthread_create(&thread, NULL, handle_client, client_arg);
+        pthread_detach(thread);
+    }
+    
+    if (log_file) {
+        fclose(log_file);
+    }
+    
+    close(server_sock);
+    return 0;
+}
